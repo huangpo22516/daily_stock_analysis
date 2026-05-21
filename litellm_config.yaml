@@ -1,0 +1,12 @@
+model_list:
+  - model_name: my-smart-model
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_base: https://api.deepseek.com
+      api_key: "os.environ/LITELLM_API_KEY" # 這行照抄，它會自動去讀取我們在第二步設定的密碼
+
+  # 如果你以後想接本地的 Ollama 模型再解除下面這幾行的註解
+  # - model_name: ollama/qwen3:8b
+  #   litellm_params:
+  #     model: ollama/qwen3:8b
+  #     api_base: http://localhost:11434
