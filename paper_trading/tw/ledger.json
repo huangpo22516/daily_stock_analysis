@@ -1,0 +1,11 @@
+{
+  "initial_cash": 100000.0,
+  "cash": 100000.0,
+  "start_date": "2026-11-26",
+  "positions": {},
+  "orders": [],
+  "trades": [],
+  "equity": [],
+  "next_id": 1,
+  "benchmark": {}
+}
