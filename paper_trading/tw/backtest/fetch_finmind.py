@@ -51,14 +51,14 @@ def fetch(dataset, data_id=None, start=START):
         params["data_id"] = data_id
     if start:
         params["start_date"] = start
-    for attempt in range(8):
+    for attempt in range(16):
         try:
             d = _get(params)
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "ignore")[:200]
-            print(f"  HTTP {e.code} {data_id}: {body}", flush=True)
+            print(f"  HTTP {e.code} {data_id} {time.strftime('%H:%M:%S')}: {body}", flush=True)
             if e.code in (402, 429):
-                time.sleep(600)
+                time.sleep(900)
                 continue
             time.sleep(60)
             continue
@@ -72,7 +72,7 @@ def fetch(dataset, data_id=None, start=START):
         msg = str(d.get("msg"))
         print(f"  status {status} {data_id}: {msg[:200]}", flush=True)
         if status == 402 or "limit" in msg.lower() or "upper" in msg.lower():
-            time.sleep(600)
+            time.sleep(900)
         else:
             time.sleep(60)
     raise RuntimeError(f"failed {dataset} {data_id}")
@@ -96,7 +96,7 @@ def run(kind):
         tmp = os.path.join(outdir, f"{c}.tmp.gz")
         pd.DataFrame(rows).to_csv(tmp, index=False, compression="gzip")
         os.replace(tmp, os.path.join(outdir, f"{c}.csv.gz"))
-        print(f"[{i+1}/{len(todo)}] {c} rows={len(rows)}", flush=True)
+        print(f"[{i+1}/{len(todo)}] {c} rows={len(rows)} {time.strftime('%H:%M:%S')}", flush=True)
         dt = time.time() - t0
         if i + 1 < len(todo):
             time.sleep(max(0.0, PACE - dt))
