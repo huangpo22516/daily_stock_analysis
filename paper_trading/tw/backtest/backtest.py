@@ -322,7 +322,7 @@ def h2_year_end(C, O, V, T, stocks, tradable, reg, md):
     return wide
 
 
-def h4_revenue(rev, C, stocks, fr, reg, md):
+def h4_revenue(rev, C, stocks, fr, reg, md, known_day=10):
     if rev.empty:
         md.append("\n## H4 月營收加速\n\n月營收資料尚未抓取完成，略過。\n")
         return None
@@ -341,7 +341,7 @@ def h4_revenue(rev, C, stocks, fr, reg, md):
         m += 1
         # 已知日：次月 10 日收盤後；t = 次月 10 日（含）之前最後交易日，t+1 開盤進場
         ky, km = (y + 1, 1) if m == 12 else (y, m + 1)
-        known = pd.Timestamp(ky, km, 10)
+        known = pd.Timestamp(ky, km, known_day)
         pos = idx.searchsorted(known, side="right") - 1
         if pos < 0 or pos >= len(idx) - 1 or idx[pos] < START:
             continue
@@ -349,6 +349,12 @@ def h4_revenue(rev, C, stocks, fr, reg, md):
         for code in r.index[r.fillna(False).values]:
             rows.append((t, code))
     sig = attach(pd.DataFrame(rows, columns=["date", "code"]), fr, reg)
+    if known_day != 10:
+        md.append(f"\n### H4 穩健性：已知日改為次月 {known_day} 日（防公告延遲/資料修正的 look-ahead）\n")
+        md.append(fmt(stats_table(sig, list(HORIZONS), ["period"])))
+        md.append("")
+        md.append(fmt(stats_table(sig, [20], ["period", "regime"])))
+        return sig
     md.append("\n## H4 月營收加速（YoY 本月 > 上月 且兩者皆 > 20%；次月 10 日視為已知日，下一交易日開盤進場）\n")
     md.append("參數固定（未調參）：1 組 × 20 日 horizon（另列 5/10 日參考）。\n")
     md.append(fmt(stats_table(sig, list(HORIZONS), ["period"])))
@@ -399,7 +405,10 @@ def main():
     h2_year_end(C, O, V, Th, have, tradable[have], reg, md)
 
     # H4
-    h4_revenue(load_revenue(stocks), C, stocks, fr, reg, md)
+    rev = load_revenue(stocks)
+    h4_revenue(rev, C, stocks, fr, reg, md)
+    if not rev.empty:
+        h4_revenue(rev, C, stocks, fr, reg, md, known_day=15)
 
     with open(os.path.join(OUT, "tables.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(md) + "\n")
