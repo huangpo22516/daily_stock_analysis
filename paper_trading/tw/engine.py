@@ -9,12 +9,14 @@
   python engine.py status
 
 撮合規則（保守近似）：
-  - 買進限價 L：開盤 <= L 以開盤價成交；否則當日最低 <= L 以 L 成交；否則未成交（當日有效）。
-  - 賣出限價 L：開盤 >= L 以開盤價成交；否則當日最高 >= L 以 L 成交。
-  - 市價單：以開盤價成交，加滑價 SLIPPAGE。
-  - 持股停損 S（收盤後檢查當日盤中）：開盤 <= S 以開盤價出場；否則最低 <= S 以 S 減滑價出場。
-    同日同時觸及停損與停利時，假設先觸停損（保守）。
-  - 零股以整股日 K 近似（盤中零股實際價差會略差，另加滑價）。
+  - 優先用 Yahoo 5 分鐘 K 依時間順序模擬；拿不到才用日 K（視為單一根 K）。
+  - 委託自 --after（預設 09:00）起生效；cancel --at 之後不再成交（之前已成交不受影響）。
+  - 買進限價 L：該根 K 開盤 <= L 以開盤價成交；否則最低 <= L 以 L 成交（零股需再低 0.2%）。
+  - 賣出限價對稱；市價單以生效後第一根 K 開盤價 ± 0.2% 滑價成交。
+  - 停損 S：該根 K 最低 <= S 即出場，價格為 min(開盤, S) 減 0.2% 滑價；觸及目標先賣一半、停損移到成本。
+    同一根 K 同時觸及停損與目標時假設先停損；當日新買進的部位從下一根 K 才開始檢查。
+  - setstop --at：盤中調整停損，只對之後的 K 生效。
+  - 一價鎖漲停買不到、鎖跌停賣不掉（停損順延至次日開盤）。
 費用：手續費 0.1425%（整股最低 20 元、零股最低 1 元）；證交稅 股票 0.3%、當沖 0.15%、ETF 0.1%。
 """
 from __future__ import annotations
@@ -202,11 +204,11 @@ def cmd_order(a):
     o = dict(id=led["next_id"], date=a.date, code=a.code, side=side, shares=int(a.shares),
              limit=a.limit, stop=a.stop, target=a.target, note=a.note or "", status="PENDING",
              strategy=a.strategy or (led["positions"].get(a.code, {}).get("strategy")),
-             invalid=a.invalid or "", prob=a.prob)
+             invalid=a.invalid or "", prob=a.prob, after=a.after or "09:00")
     led["orders"].append(o)
     led["next_id"] += 1
     save(led)
-    print(f"委託 #{o['id']} {side} {a.code} {a.shares} 股 @ {a.limit or '開盤市價'} ({a.date}) [{o['strategy']}]")
+    print(f"委託 #{o['id']} {side} {a.code} {a.shares} 股 @ {a.limit or '市價'} ({a.date} {o['after']} 起) [{o['strategy']}]")
     if a.limit:
         c = roundtrip_cost(a.code, a.limit, int(a.shares))
         print(f"  來回成本約 {c:,.0f} 元（{c / (a.limit * a.shares) * 100:.2f}%）"
@@ -218,9 +220,15 @@ def cmd_cancel(a):
     led = load()
     for o in led["orders"]:
         if o["id"] == a.order_id and o["status"] == "PENDING":
-            o["status"] = "CANCELLED"
+            if a.at:  # 盤中取消：只取消 a.at 之後尚未成交的部分（結算時判斷）
+                o["cancel_at"] = a.at
+                print(f"#{a.order_id} 設定於 {a.at} 取消（若在此之前已成交則不受影響）")
+            else:
+                o["status"] = "CANCELLED"
+                print(f"已取消 #{a.order_id}")
+            if a.reason:
+                o["cancel_reason"] = a.reason
             save(led)
-            print(f"已取消 #{a.order_id}")
             return
     sys.exit("找不到可取消的委託")
 
@@ -272,78 +280,143 @@ def _sell(led, code, shares, px, d, note=""):
     return None
 
 
+_bars_cache: dict[tuple[str, str], list | None] = {}
+
+
+def bars(code: str, d: str) -> list | None:
+    """當日 5 分鐘 K（Yahoo，約保留 60 天）：[(HH:MM, o, h, l, c), ...]；拿不到回傳 None。"""
+    key = (code, d)
+    if key in _bars_cache:
+        return _bars_cache[key]
+    res = None
+    try:
+        import yfinance as yf
+        h = yf.Ticker(f"{code}.TW").history(period="60d", interval="5m")
+        h = h[h.index.strftime("%Y-%m-%d") == d]
+        if len(h):
+            res = [(i.strftime("%H:%M"), float(r.Open), float(r.High), float(r.Low), float(r.Close))
+                   for i, r in h.iterrows() if r.High > 0]
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] 5m {code} {d}: {e}", file=sys.stderr)
+    _bars_cache[key] = res or None
+    return _bars_cache[key]
+
+
+def _day_bars(code: str, d: str, k: dict) -> tuple[list, bool]:
+    """優先 5 分鐘 K；沒有就用日 K 當成單一根（退化為日 K 邏輯）。回傳 (bars, is_intraday)。"""
+    b = bars(code, d)
+    if b:
+        return b, True
+    return [("09:00", k["open"], k["high"], k["low"], k["close"])], False
+
+
 def cmd_settle(a):
+    """以 5 分鐘 K 依時間順序模擬：委託（含 --after 生效時間、cancel --at）、停損/停利、盤中改停損。"""
     led = load()
     d = a.date
     log = []
-    # 1) 撮合當日委託（先賣後買，釋出現金）
     todays = [o for o in led["orders"] if o["status"] == "PENDING" and o["date"] == d]
-    todays.sort(key=lambda o: 0 if o["side"] == "SELL" else 1)
+    codes = {o["code"] for o in todays} | set(led["positions"])
+    daily, series, intraday = {}, {}, {}
+    for c in codes:
+        k = ohlc(c, d)
+        if k:
+            daily[c] = k
+            series[c], intraday[c] = _day_bars(c, d, k)
     for o in todays:
-        k = ohlc(o["code"], d)
-        if not k:
+        if o["code"] not in daily:
             o["status"] = "NO_DATA"
             log.append(f"#{o['id']} {o['code']} 無當日行情（停牌或資料未出），未成交")
-            continue
-        odd = o["shares"] % 1000 != 0
-        slip = SLIPPAGE if odd else 0.0
-        px = None
-        lk = locked(k)
-        if (o["side"] == "BUY" and lk == "UP") or (o["side"] == "SELL" and lk == "DOWN"):
+        elif (o["side"] == "BUY" and locked(daily[o["code"]]) == "UP") or \
+             (o["side"] == "SELL" and locked(daily[o["code"]]) == "DOWN"):
             o["status"] = "EXPIRED"
-            log.append(f"#{o['id']} {o['side']} {o['code']} 當日一價鎖{'漲' if lk == 'UP' else '跌'}停，視為排不到未成交")
-            continue
-        if o["side"] == "BUY":
-            if o["limit"] is None:
-                px = round_tick(k["open"] * (1 + SLIPPAGE), up=True)
-            elif k["open"] <= o["limit"]:
-                px = k["open"]
-            elif k["low"] <= o["limit"] * (1 - slip):
-                px = o["limit"]
-            err = _buy(led, o["code"], o["shares"], px, d, o) if px else None
-        else:
-            if o["limit"] is None:
-                px = round_tick(k["open"] * (1 - SLIPPAGE), up=False)
-            elif k["open"] >= o["limit"]:
-                px = k["open"]
-            elif k["high"] >= o["limit"] * (1 + slip):
-                px = o["limit"]
-            err = _sell(led, o["code"], o["shares"], px, d, o.get("note", "")) if px else None
-        if px and not err:
-            o.update(status="FILLED", fill_price=px)
-            log.append(f"#{o['id']} {o['side']} {o['code']} {o['shares']} 股 成交 @ {px}")
-        elif err:
-            o.update(status="REJECTED", reason=err)
-            log.append(f"#{o['id']} {o['code']} 被拒：{err}")
-        else:
-            o["status"] = "EXPIRED"
-            log.append(f"#{o['id']} {o['side']} {o['code']} @ {o['limit']} 未成交（當日 L {k['low']} / H {k['high']}）")
-    # 2) 停損 / 停利（不檢查當天才買進的部位的開盤，但盤中仍檢查）
-    for code, p in list(led["positions"].items()):
-        k = ohlc(code, d)
-        if not k:
-            continue
-        s, tg = p.get("stop"), p.get("target")
-        if p.get("force_exit") and locked(k) != "DOWN":
-            px = round_tick(k["open"] * (1 - SLIPPAGE), up=False)
-            _sell(led, code, p["shares"], px, d, "停損(前日鎖跌停延續)")
-            log.append(f"{code} 前日停損未能出場，今日開盤出場 @ {px}")
-            continue
-        if s and k["low"] <= s and locked(k) == "DOWN":
-            log.append(f"{code} 跌破停損 {s} 但鎖跌停賣不掉，明日開盤續處理")
-            p["force_exit"] = True
-        elif s and k["low"] <= s:
-            px = k["open"] if (k["open"] <= s and p.get("last_buy") != d) else round_tick(s * (1 - SLIPPAGE), up=False)
-            _sell(led, code, p["shares"], px, d, "停損")
-            log.append(f"{code} 觸發停損 {s}，出場 @ {px}")
-        elif tg and k["high"] >= tg:
-            half = p["shares"] // 2 or p["shares"]
-            tpx = k["open"] if (k["open"] >= tg and p.get("last_buy") != d) else tg
-            _sell(led, code, half, tpx, d, "停利(半)")
-            if code in led["positions"]:
-                led["positions"][code]["target"] = None
-                led["positions"][code]["stop"] = max(s or 0, round(led["positions"][code]["avg_cost"], 2))
-            log.append(f"{code} 觸及目標 {tg}，賣出 {half} 股 @ {tpx}，剩餘部位停損上移至成本")
+            log.append(f"#{o['id']} {o['side']} {o['code']} 當日一價鎖停板，視為排不到未成交")
+    fill_time: dict[str, str] = {}
+    timeline = sorted({b[0] for c in series for b in series[c]})
+    for t in timeline:
+        # 1) 委託：先賣後買
+        live = [o for o in todays if o["status"] == "PENDING" and t >= o.get("after", "09:00")
+                and not (o.get("cancel_at") and t >= o["cancel_at"])]
+        live.sort(key=lambda o: 0 if o["side"] == "SELL" else 1)
+        for o in live:
+            bar = next((b for b in series.get(o["code"], []) if b[0] == t), None)
+            if not bar:
+                continue
+            _, bo, bh, bl, _bc = bar
+            slip = SLIPPAGE if o["shares"] % 1000 else 0.0
+            px = None
+            if o["side"] == "BUY":
+                if o["limit"] is None:
+                    px = round_tick(bo * (1 + SLIPPAGE), up=True)
+                elif bo <= o["limit"]:
+                    px = round(bo, 2)
+                elif bl <= o["limit"] * (1 - slip):
+                    px = o["limit"]
+                err = _buy(led, o["code"], o["shares"], px, d, o) if px else None
+            else:
+                if o["limit"] is None:
+                    px = round_tick(bo * (1 - SLIPPAGE), up=False)
+                elif bo >= o["limit"]:
+                    px = round(bo, 2)
+                elif bh >= o["limit"] * (1 + slip):
+                    px = o["limit"]
+                err = _sell(led, o["code"], o["shares"], px, d, o.get("note", "")) if px else None
+            if px and not err:
+                o.update(status="FILLED", fill_price=px, fill_time=t if intraday[o["code"]] else None)
+                fill_time[o["code"]] = t
+                log.append(f"#{o['id']} {o['side']} {o['code']} {o['shares']} 股 成交 @ {px}"
+                           + (f"（{t}）" if intraday[o["code"]] else "（日K近似）"))
+            elif err:
+                o.update(status="REJECTED", reason=err)
+                log.append(f"#{o['id']} {o['code']} 被拒：{err}")
+        # 2) 停損 / 停利（同一根 K 先停損後停利；當日新買進的部位從下一根 K 才開始檢查）
+        for code, p in list(led["positions"].items()):
+            bar = next((b for b in series.get(code, []) if b[0] == t), None)
+            if not bar or (code in fill_time and t <= fill_time[code] and intraday[code]):
+                continue
+            _, bo, bh, bl, _bc = bar
+            ps = p.get("pending_stop")
+            if ps and (ps["date"] < d or (ps["date"] == d and t >= ps["at"])):
+                p["stop"] = ps["stop"]
+                p.pop("pending_stop")
+                log.append(f"{code} 停損調整為 {p['stop']}（{ps['date']} {ps['at']} 生效）")
+            s, tg = p.get("stop"), p.get("target")
+            lk = locked(daily[code])
+            if p.get("force_exit") and lk != "DOWN":
+                px = round_tick(bo * (1 - SLIPPAGE), up=False)
+                _sell(led, code, p["shares"], px, d, "停損(前日鎖跌停延續)")
+                log.append(f"{code} 前日停損未能出場，今日 {t} 出場 @ {px}")
+            elif s and bl <= s and lk == "DOWN":
+                if not p.get("force_exit"):
+                    log.append(f"{code} 跌破停損 {s} 但鎖跌停賣不掉，明日開盤續處理")
+                p["force_exit"] = True
+            elif s and bl <= s:
+                px = round_tick((bo if bo <= s else s) * (1 - SLIPPAGE), up=False)
+                _sell(led, code, p["shares"], px, d, "停損")
+                log.append(f"{code} 觸發停損 {s}，{t if intraday[code] else ''} 出場 @ {px}")
+            elif tg and bh >= tg:
+                half = p["shares"] // 2 or p["shares"]
+                tpx = round(bo, 2) if bo >= tg else tg
+                _sell(led, code, half, tpx, d, "停利(半)")
+                if code in led["positions"]:
+                    led["positions"][code]["target"] = None
+                    led["positions"][code]["stop"] = max(s or 0, round(led["positions"][code]["avg_cost"], 2))
+                log.append(f"{code} 觸及目標 {tg}，賣出 {half} 股 @ {tpx}，剩餘停損上移至成本")
+    for o in todays:
+        if o["status"] == "PENDING":
+            if o.get("cancel_at"):
+                o["status"] = "CANCELLED"
+                log.append(f"#{o['id']} {o['code']} 於 {o['cancel_at']} 前未成交，已取消")
+            else:
+                k = daily.get(o["code"])
+                o["status"] = "EXPIRED"
+                log.append(f"#{o['id']} {o['side']} {o['code']} @ {o['limit']} 未成交"
+                           + (f"（當日 L {k['low']} / H {k['high']}）" if k else ""))
+    for code, p in led["positions"].items():  # 盤後才送出的改停損
+        ps = p.get("pending_stop")
+        if ps and ps["date"] <= d:
+            p["stop"] = ps["stop"]
+            p.pop("pending_stop")
     _settle_shadow(led, d, log)
     # 3) 計算淨值
     mv = 0.0
@@ -385,6 +458,22 @@ def _print_status(led):
     pend = [o for o in led["orders"] if o["status"] == "PENDING"]
     if pend:
         print("待撮合委託：", ", ".join(f"#{o['id']} {o['side']} {o['code']} {o['shares']}@{o['limit']} ({o['date']})" for o in pend))
+
+
+def cmd_setstop(a):
+    """調整停損（只能上移，除非 --force）。盤中決策用 --at HH:MM，結算時只對之後的 K 棒生效。"""
+    led = load()
+    p = led["positions"].get(a.code)
+    if not p:
+        sys.exit("無此持股")
+    if p.get("stop") and a.stop < p["stop"] and not a.force:
+        sys.exit(f"停損只能上移（目前 {p['stop']}）；確定要下移請加 --force 並在報告說明")
+    if a.at:
+        p["pending_stop"] = dict(date=a.date, at=a.at, stop=a.stop)
+    else:
+        p["stop"] = a.stop
+    save(led)
+    print(f"{a.code} 停損 → {a.stop}" + (f"（{a.date} {a.at} 起生效）" if a.at else ""))
 
 
 def cmd_shadow(a):
@@ -468,8 +557,13 @@ def main():
     p.add_argument("--note", help="交易理由"); p.add_argument("--strategy", help="策略標籤")
     p.add_argument("--invalid", help="失效條件：什麼情況代表判斷錯了")
     p.add_argument("--prob", type=float, help="事前機率：先到目標而非停損的機率(0-1)，用於校準")
+    p.add_argument("--after", help="生效時間 HH:MM（盤中決策用，預設 09:00）")
     p.add_argument("--date", default=today); p.set_defaults(fn=cmd_order)
-    p = sp.add_parser("cancel"); p.add_argument("order_id", type=int); p.set_defaults(fn=cmd_cancel)
+    p = sp.add_parser("cancel"); p.add_argument("order_id", type=int)
+    p.add_argument("--at", help="盤中取消時間 HH:MM"); p.add_argument("--reason"); p.set_defaults(fn=cmd_cancel)
+    p = sp.add_parser("setstop"); p.add_argument("code"); p.add_argument("stop", type=float)
+    p.add_argument("--at", help="盤中生效時間 HH:MM"); p.add_argument("--date", default=today)
+    p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_setstop)
     p = sp.add_parser("settle"); p.add_argument("--date", default=today); p.set_defaults(fn=cmd_settle)
     p = sp.add_parser("status"); p.set_defaults(fn=cmd_status)
     p = sp.add_parser("stats"); p.set_defaults(fn=cmd_stats)
