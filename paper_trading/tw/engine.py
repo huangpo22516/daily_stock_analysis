@@ -310,11 +310,56 @@ def _day_bars(code: str, d: str, k: dict) -> tuple[list, bool]:
     return [("09:00", k["open"], k["high"], k["low"], k["close"])], False
 
 
+def exdiv(code: str, d: str) -> dict | None:
+    """當日除權息結果（FinMind TaiwanStockDividendResult）：{'cash': 現金股利, 'kind': '息'/'權'/'權息'}。"""
+    try:
+        js = requests.get("https://api.finmindtrade.com/api/v4/data",
+                          params=dict(dataset="TaiwanStockDividendResult", data_id=code, start_date=d, end_date=d),
+                          timeout=20).json()
+        for r in js.get("data", []):
+            if r["date"] == d:
+                return dict(amount=float(r["stock_and_cache_dividend"]), kind=r["stock_or_cache_dividend"],
+                            before=r["before_price"], after=r["after_price"])
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] 除權息 {code} {d}: {e}", file=sys.stderr)
+    return None
+
+
+def _apply_dividends(led, d, log):
+    """除息日：現金股利入帳（實際約一個月後撥付，這裡簡化為當日），停損/目標同步下調；影子部位價位一併調整。
+    除權（配股）需人工處理，僅提示。"""
+    codes = set(led["positions"]) | {s_["code"] for s_ in led.get("shadow", []) if s_["status"] in ("WAIT", "OPEN")}
+    for code in codes:
+        x = exdiv(code, d)
+        if not x:
+            continue
+        if x["kind"] != "息":
+            log.append(f"⚠️ {code} {d} 除權（{x['kind']}），配股需人工調整股數")
+            continue
+        cash_div = round(x["before"] - x["after"], 4) or x["amount"]
+        p = led["positions"].get(code)
+        if p:
+            amt = math.floor(cash_div * p["shares"])
+            led["cash"] += amt
+            led["trades"].append(dict(date=d, code=code, side="DIV", shares=p["shares"], price=cash_div, fee=0, tax=0,
+                                      pnl=amt, strategy=p.get("strategy"), note="現金股利"))
+            for f in ("stop", "target", "init_stop"):
+                if p.get(f):
+                    p[f] = round(p[f] - cash_div, 2)
+            log.append(f"{code} 除息 {cash_div:.2f} 元，股利 {amt} 元入帳，停損/目標同步下調")
+        for s_ in led.get("shadow", []):
+            if s_["code"] == code and s_["status"] in ("WAIT", "OPEN"):
+                for f in ("entry", "stop", "target", "fill"):
+                    if s_.get(f):
+                        s_[f] = round(s_[f] - cash_div, 2)
+
+
 def cmd_settle(a):
     """以 5 分鐘 K 依時間順序模擬：委託（含 --after 生效時間、cancel --at）、停損/停利、盤中改停損。"""
     led = load()
     d = a.date
     log = []
+    _apply_dividends(led, d, log)
     todays = [o for o in led["orders"] if o["status"] == "PENDING" and o["date"] == d]
     codes = {o["code"] for o in todays} | set(led["positions"])
     daily, series, intraday = {}, {}, {}
