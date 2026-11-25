@@ -202,7 +202,7 @@ def cmd_order(a):
     o = dict(id=led["next_id"], date=a.date, code=a.code, side=side, shares=int(a.shares),
              limit=a.limit, stop=a.stop, target=a.target, note=a.note or "", status="PENDING",
              strategy=a.strategy or (led["positions"].get(a.code, {}).get("strategy")),
-             invalid=a.invalid or "")
+             invalid=a.invalid or "", prob=a.prob)
     led["orders"].append(o)
     led["next_id"] += 1
     save(led)
@@ -240,7 +240,8 @@ def _buy(led, code, shares, px, d, o=None):
         p = led["positions"][code] = dict(shares=shares, avg_cost=(amt + f) / shares, opened=d,
                                           stop=None, target=None, last_buy=d,
                                           strategy=(o or {}).get("strategy"), thesis=(o or {}).get("note", ""),
-                                          invalid=(o or {}).get("invalid", ""))
+                                          invalid=(o or {}).get("invalid", ""), prob=(o or {}).get("prob"),
+                                          init_stop=(o or {}).get("stop"))
     p["last_buy"] = d
     if o:
         if o.get("stop"):
@@ -266,6 +267,7 @@ def _sell(led, code, shares, px, d, note=""):
         del led["positions"][code]
     led["trades"].append(dict(date=d, code=code, side="SELL", shares=shares, price=px, fee=f, tax=t,
                               pnl=round(pnl), daytrade=daytrade, note=note, strategy=p.get("strategy"),
+                              prob=p.get("prob"), opened=p.get("opened"),
                               ret=round(px / p["avg_cost"] - 1, 4)))
     return None
 
@@ -336,11 +338,13 @@ def cmd_settle(a):
             log.append(f"{code} 觸發停損 {s}，出場 @ {px}")
         elif tg and k["high"] >= tg:
             half = p["shares"] // 2 or p["shares"]
-            _sell(led, code, half, tg, d, "停利(半)")
+            tpx = k["open"] if (k["open"] >= tg and p.get("last_buy") != d) else tg
+            _sell(led, code, half, tpx, d, "停利(半)")
             if code in led["positions"]:
                 led["positions"][code]["target"] = None
                 led["positions"][code]["stop"] = max(s or 0, round(led["positions"][code]["avg_cost"], 2))
-            log.append(f"{code} 觸及目標 {tg}，賣出 {half} 股，剩餘部位停損上移至成本")
+            log.append(f"{code} 觸及目標 {tg}，賣出 {half} 股 @ {tpx}，剩餘部位停損上移至成本")
+    _settle_shadow(led, d, log)
     # 3) 計算淨值
     mv = 0.0
     for code, p in led["positions"].items():
@@ -352,8 +356,13 @@ def cmd_settle(a):
     if ix and "taiex_start" not in led["benchmark"]:
         led["benchmark"]["taiex_start"] = ix
     led["equity"] = [e for e in led["equity"] if e["date"] != d]
+    prev = led["equity"][-1] if led["equity"] else None
+    # 同曝險基準：昨日持股比重 × 今日加權指數報酬，累積起來，衡量「選股/擇時」是否勝過單純的大盤曝險
+    adj = prev.get("bench_adj", 1.0) if prev else 1.0
+    if prev and prev.get("taiex") and ix and prev["equity"]:
+        adj *= 1 + (prev["market_value"] / prev["equity"]) * (ix / prev["taiex"] - 1)
     led["equity"].append(dict(date=d, cash=round(led["cash"]), market_value=round(mv), equity=round(eq),
-                              taiex=ix))
+                              taiex=ix, bench_adj=round(adj, 6)))
     save(led)
     print("\n".join(log) or "（今日無委託）")
     _print_status(led)
@@ -371,10 +380,44 @@ def _print_status(led):
         ret = eq["equity"] / led["initial_cash"] - 1
         bm = led["benchmark"].get("taiex_start")
         bret = (eq["taiex"] / bm - 1) if (bm and eq.get("taiex")) else None
-        print(f"淨值 {eq['equity']:,} ({ret * 100:+.2f}%)" + (f"｜加權指數同期 {bret * 100:+.2f}%" if bret is not None else ""))
+        print(f"淨值 {eq['equity']:,} ({ret * 100:+.2f}%)" + (f"｜加權指數同期 {bret * 100:+.2f}%" if bret is not None else "")
+              + (f"｜同曝險基準 {(eq.get('bench_adj', 1) - 1) * 100:+.2f}%" if eq.get("bench_adj") else ""))
     pend = [o for o in led["orders"] if o["status"] == "PENDING"]
     if pend:
         print("待撮合委託：", ", ".join(f"#{o['id']} {o['side']} {o['code']} {o['shares']}@{o['limit']} ({o['date']})" for o in pend))
+
+
+def cmd_shadow(a):
+    """影子部位：記錄『看到但沒做』或規則訊號的假想交易，不占資金，用來擴大樣本、降低選擇偏誤。"""
+    led = load()
+    led.setdefault("shadow", []).append(dict(date=a.date, code=a.code, entry=a.entry, stop=a.stop, target=a.target,
+                                             strategy=a.strategy, note=a.note or "", prob=a.prob, status="WAIT",
+                                             expire=a.expire))
+    save(led)
+    print(f"影子 {a.code} 進場 {a.entry} 停損 {a.stop} 目標 {a.target} [{a.strategy}]")
+
+
+def _settle_shadow(led, d, log):
+    for s_ in led.get("shadow", []):
+        if s_["status"] in ("WIN", "LOSS", "EXPIRED") or s_["date"] > d:
+            continue
+        k = ohlc(s_["code"], d)
+        if not k:
+            continue
+        if s_["status"] == "WAIT":
+            if locked(k) == "UP" or k["low"] > s_["entry"]:
+                if s_.get("expire") and d >= s_["expire"]:
+                    s_["status"] = "EXPIRED"
+                continue
+            s_.update(status="OPEN", fill=min(k["open"], s_["entry"]), filled=d)
+        if s_["status"] == "OPEN":
+            if k["low"] <= s_["stop"]:
+                s_.update(status="LOSS", exit=s_["stop"], closed=d)
+            elif k["high"] >= s_["target"] and d != s_["filled"]:
+                s_.update(status="WIN", exit=s_["target"], closed=d)
+            if s_["status"] in ("WIN", "LOSS"):
+                s_["r"] = round((s_["exit"] - s_["fill"]) / (s_["fill"] - s_["stop"]), 2)
+                log.append(f"影子 {s_['code']} [{s_['strategy']}] {s_['status']} R={s_['r']}")
 
 
 def cmd_stats(a):
@@ -394,6 +437,19 @@ def cmd_stats(a):
     for k, g in agg.items():
         wr = f"{g['win'] / g['n'] * 100:.0f}%" if g["n"] else "-"
         print(f"{k:<14}{g['n']:>6}{wr:>8}{g['pnl']:>12,}{g.get('open', 0):>10,}{g['cost']:>10,}")
+    sh = [x for x in led.get("shadow", []) if x["status"] in ("WIN", "LOSS")]
+    if sh:
+        print("\n影子部位（含實單以外的訊號）：")
+        by: dict[str, list] = {}
+        for x in sh:
+            by.setdefault(x["strategy"], []).append(x["r"])
+        for k, rs in by.items():
+            print(f"  {k}: {len(rs)} 筆, 平均 R {sum(rs) / len(rs):+.2f}, 勝率 {sum(r > 0 for r in rs) / len(rs) * 100:.0f}%")
+    pr = [(t["prob"], 1 if t["pnl"] > 0 else 0) for t in led["trades"] if t["side"] == "SELL" and t.get("prob") is not None]
+    pr += [(x["prob"], 1 if x["status"] == "WIN" else 0) for x in sh if x.get("prob") is not None]
+    if pr:
+        brier = sum((p - o) ** 2 for p, o in pr) / len(pr)
+        print(f"\n機率校準：{len(pr)} 筆，Brier {brier:.3f}（0.25 = 擲硬幣水準，越低越好）")
 
 
 def cmd_status(a):
@@ -411,11 +467,17 @@ def main():
     p.add_argument("--limit", type=float); p.add_argument("--stop", type=float); p.add_argument("--target", type=float)
     p.add_argument("--note", help="交易理由"); p.add_argument("--strategy", help="策略標籤")
     p.add_argument("--invalid", help="失效條件：什麼情況代表判斷錯了")
+    p.add_argument("--prob", type=float, help="事前機率：先到目標而非停損的機率(0-1)，用於校準")
     p.add_argument("--date", default=today); p.set_defaults(fn=cmd_order)
     p = sp.add_parser("cancel"); p.add_argument("order_id", type=int); p.set_defaults(fn=cmd_cancel)
     p = sp.add_parser("settle"); p.add_argument("--date", default=today); p.set_defaults(fn=cmd_settle)
     p = sp.add_parser("status"); p.set_defaults(fn=cmd_status)
     p = sp.add_parser("stats"); p.set_defaults(fn=cmd_stats)
+    p = sp.add_parser("shadow"); p.add_argument("code"); p.add_argument("--entry", type=float, required=True)
+    p.add_argument("--stop", type=float, required=True); p.add_argument("--target", type=float, required=True)
+    p.add_argument("--strategy", required=True); p.add_argument("--note"); p.add_argument("--prob", type=float)
+    p.add_argument("--expire", help="未進場的失效日"); p.add_argument("--date", default=today)
+    p.set_defaults(fn=cmd_shadow)
     a = ap.parse_args()
     a.fn(a)
 
