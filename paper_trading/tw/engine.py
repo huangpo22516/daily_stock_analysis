@@ -66,6 +66,11 @@ def tax(amount: float, code: str, daytrade: bool) -> int:
     return math.floor(amount * rate)
 
 
+def roundtrip_cost(code: str, price: float, shares: int, daytrade: bool = False) -> float:
+    amt = price * shares
+    return fee(amt, shares) * 2 + tax(amt, code, daytrade)
+
+
 def tick(price: float) -> float:
     """台股升降單位（股票）。ETF 規則不同，這裡只用來把滑價後價格取整。"""
     for lim, t in ((10, 0.01), (50, 0.05), (100, 0.1), (500, 0.5), (1000, 1.0)):
@@ -192,12 +197,21 @@ def cmd_order(a):
     side = a.side.upper()
     if side not in ("BUY", "SELL"):
         sys.exit("side 必須是 BUY/SELL")
+    if side == "BUY" and not (a.strategy and a.note and a.invalid):
+        sys.exit("買進委託必須提供 --strategy、--note（理由）與 --invalid（失效條件）")
     o = dict(id=led["next_id"], date=a.date, code=a.code, side=side, shares=int(a.shares),
-             limit=a.limit, stop=a.stop, target=a.target, note=a.note or "", status="PENDING")
+             limit=a.limit, stop=a.stop, target=a.target, note=a.note or "", status="PENDING",
+             strategy=a.strategy or (led["positions"].get(a.code, {}).get("strategy")),
+             invalid=a.invalid or "")
     led["orders"].append(o)
     led["next_id"] += 1
     save(led)
-    print(f"委託 #{o['id']} {side} {a.code} {a.shares} 股 @ {a.limit or '開盤市價'} ({a.date})")
+    print(f"委託 #{o['id']} {side} {a.code} {a.shares} 股 @ {a.limit or '開盤市價'} ({a.date}) [{o['strategy']}]")
+    if a.limit:
+        c = roundtrip_cost(a.code, a.limit, int(a.shares))
+        print(f"  來回成本約 {c:,.0f} 元（{c / (a.limit * a.shares) * 100:.2f}%）"
+              + (f"；目標報酬 {(a.target / a.limit - 1) * 100:+.1f}%" if a.target and side == "BUY" else "")
+              + (f"；停損風險 {(a.stop / a.limit - 1) * 100:+.1f}%" if a.stop and side == "BUY" else ""))
 
 
 def cmd_cancel(a):
@@ -224,7 +238,9 @@ def _buy(led, code, shares, px, d, o=None):
         p["avg_cost"] = tot / p["shares"]
     else:
         p = led["positions"][code] = dict(shares=shares, avg_cost=(amt + f) / shares, opened=d,
-                                          stop=None, target=None, last_buy=d)
+                                          stop=None, target=None, last_buy=d,
+                                          strategy=(o or {}).get("strategy"), thesis=(o or {}).get("note", ""),
+                                          invalid=(o or {}).get("invalid", ""))
     p["last_buy"] = d
     if o:
         if o.get("stop"):
@@ -232,7 +248,7 @@ def _buy(led, code, shares, px, d, o=None):
         if o.get("target"):
             p["target"] = o["target"]
     led["trades"].append(dict(date=d, code=code, side="BUY", shares=shares, price=px, fee=f, tax=0,
-                              note=(o or {}).get("note", "")))
+                              strategy=(o or {}).get("strategy"), note=(o or {}).get("note", "")))
     return None
 
 
@@ -249,7 +265,8 @@ def _sell(led, code, shares, px, d, note=""):
     if p["shares"] == 0:
         del led["positions"][code]
     led["trades"].append(dict(date=d, code=code, side="SELL", shares=shares, price=px, fee=f, tax=t,
-                              pnl=round(pnl), daytrade=daytrade, note=note))
+                              pnl=round(pnl), daytrade=daytrade, note=note, strategy=p.get("strategy"),
+                              ret=round(px / p["avg_cost"] - 1, 4)))
     return None
 
 
@@ -360,6 +377,25 @@ def _print_status(led):
         print("待撮合委託：", ", ".join(f"#{o['id']} {o['side']} {o['code']} {o['shares']}@{o['limit']} ({o['date']})" for o in pend))
 
 
+def cmd_stats(a):
+    led = load()
+    agg: dict[str, dict] = {}
+    for t in led["trades"]:
+        g = agg.setdefault(t.get("strategy") or "未標記", dict(n=0, win=0, pnl=0, cost=0))
+        g["cost"] += t["fee"] + t["tax"]
+        if t["side"] == "SELL":
+            g["n"] += 1
+            g["win"] += t["pnl"] > 0
+            g["pnl"] += t["pnl"]
+    for code, p in led["positions"].items():
+        g = agg.setdefault(p.get("strategy") or "未標記", dict(n=0, win=0, pnl=0, cost=0))
+        g["open"] = g.get("open", 0) + round((p.get("last_close", p["avg_cost"]) - p["avg_cost"]) * p["shares"])
+    print(f"{'策略':<14}{'平倉筆數':>6}{'勝率':>8}{'已實現(淨)':>12}{'未實現':>10}{'累計費稅':>10}")
+    for k, g in agg.items():
+        wr = f"{g['win'] / g['n'] * 100:.0f}%" if g["n"] else "-"
+        print(f"{k:<14}{g['n']:>6}{wr:>8}{g['pnl']:>12,}{g.get('open', 0):>10,}{g['cost']:>10,}")
+
+
 def cmd_status(a):
     _print_status(load())
 
@@ -373,10 +409,13 @@ def main():
     p.set_defaults(fn=cmd_init)
     p = sp.add_parser("order"); p.add_argument("side"); p.add_argument("code"); p.add_argument("shares", type=int)
     p.add_argument("--limit", type=float); p.add_argument("--stop", type=float); p.add_argument("--target", type=float)
-    p.add_argument("--note"); p.add_argument("--date", default=today); p.set_defaults(fn=cmd_order)
+    p.add_argument("--note", help="交易理由"); p.add_argument("--strategy", help="策略標籤")
+    p.add_argument("--invalid", help="失效條件：什麼情況代表判斷錯了")
+    p.add_argument("--date", default=today); p.set_defaults(fn=cmd_order)
     p = sp.add_parser("cancel"); p.add_argument("order_id", type=int); p.set_defaults(fn=cmd_cancel)
     p = sp.add_parser("settle"); p.add_argument("--date", default=today); p.set_defaults(fn=cmd_settle)
     p = sp.add_parser("status"); p.set_defaults(fn=cmd_status)
+    p = sp.add_parser("stats"); p.set_defaults(fn=cmd_stats)
     a = ap.parse_args()
     a.fn(a)
 
