@@ -62,6 +62,14 @@
       "equity": 100000,
       "taiex": 39151.81,
       "bench_adj": 1.0
+    },
+    {
+      "date": "2026-11-27",
+      "cash": 100000,
+      "market_value": 0,
+      "equity": 100000,
+      "taiex": 39308.08,
+      "bench_adj": 1.0
     }
   ],
   "next_id": 4,
