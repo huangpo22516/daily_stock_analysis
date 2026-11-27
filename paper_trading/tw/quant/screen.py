@@ -221,9 +221,12 @@ def main():
         s["sc_resil"] = pr(g.sell_rel)
         s["sc_risk"] = (pr(g.atr_pct, asc=False) + pr(g.dist_high20)) / 2
         pen = np.where(g.c_ma20 > 0.15, -10, 0) + np.where(g.atr_pct > 0.06, -10, 0) \
-            + np.where(g.attention.str.contains("注意"), -5, 0)
+            + np.where(g.attention.str.contains("注意"), -5, 0) \
+            + np.where(pr(g.inst10_pct) <= 10, -10, 0)  # 法人大幅賣超（後 10%）只作排除用，不再加分
         s["penalty"] = pen
-        s["score"] = 0.35 * s.sc_trend + 0.25 * s.sc_flow + 0.20 * s.sc_resil + 0.20 * s.sc_risk + s.penalty
+        # 2026-11-27 週檢討：flow 因子回測樣本外無超額（backtest/RESULTS.md H1/H3），權重 25% → 0，改為上面的排除條件；
+        # 其餘權重依原比例放大（0.35:0.20:0.20）。sc_flow 仍輸出供參考。
+        s["score"] = (0.35 * s.sc_trend + 0.20 * s.sc_resil + 0.20 * s.sc_risk) / 0.75 + s.penalty
         parts.append(s)
     df = df.join(pd.concat(parts))
 

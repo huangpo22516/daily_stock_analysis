@@ -532,16 +532,22 @@ def cmd_shadow(a):
 
 
 def _settle_shadow(led, d, log):
+    """影子撮合與實單零股規則一致（最低需 <= 進場價 × (1 - 滑價) 才算成交）。
+    - ref_open：第一個有效交易日的開盤價，用來計算「沒成交的機會成本」（若當天開盤就買，到期時的報酬）。
+    - 到期（expire）：未成交 → EXPIRED 並記 missed_ret；已成交未出場 → 以到期日收盤價出場並計 R。"""
     for s_ in led.get("shadow", []):
         if s_["status"] in ("WIN", "LOSS", "EXPIRED") or s_["date"] > d:
             continue
         k = ohlc(s_["code"], d)
         if not k:
             continue
+        s_.setdefault("ref_open", k["open"])
+        expiring = bool(s_.get("expire")) and d >= s_["expire"]
         if s_["status"] == "WAIT":
-            if locked(k) == "UP" or k["low"] > s_["entry"]:
-                if s_.get("expire") and d >= s_["expire"]:
-                    s_["status"] = "EXPIRED"
+            if locked(k) == "UP" or k["low"] > s_["entry"] * (1 - SLIPPAGE):
+                if expiring:
+                    s_.update(status="EXPIRED", closed=d, missed_ret=round(k["close"] / s_["ref_open"] - 1, 4))
+                    log.append(f"影子 {s_['code']} [{s_['strategy']}] 到期未成交，若開盤買進報酬 {s_['missed_ret']:+.2%}")
                 continue
             s_.update(status="OPEN", fill=min(k["open"], s_["entry"]), filled=d)
         if s_["status"] == "OPEN":
@@ -549,9 +555,16 @@ def _settle_shadow(led, d, log):
                 s_.update(status="LOSS", exit=s_["stop"], closed=d)
             elif k["high"] >= s_["target"] and d != s_["filled"]:
                 s_.update(status="WIN", exit=s_["target"], closed=d)
-            if s_["status"] in ("WIN", "LOSS"):
+            elif expiring:
+                s_.update(status="EXPIRED", exit=k["close"], closed=d)
+            if s_["status"] in ("WIN", "LOSS") or (s_["status"] == "EXPIRED" and "exit" in s_):
                 s_["r"] = round((s_["exit"] - s_["fill"]) / (s_["fill"] - s_["stop"]), 2)
                 log.append(f"影子 {s_['code']} [{s_['strategy']}] {s_['status']} R={s_['r']}")
+
+
+def p0(entry, stop, target):
+    """零漂移基準機率：價格隨機漫步時先碰目標的機率 ≈ 停損距離 /（停損距離 + 目標距離）。"""
+    return (entry - stop) / (target - stop)
 
 
 def cmd_stats(a):
@@ -571,7 +584,7 @@ def cmd_stats(a):
     for k, g in agg.items():
         wr = f"{g['win'] / g['n'] * 100:.0f}%" if g["n"] else "-"
         print(f"{k:<14}{g['n']:>6}{wr:>8}{g['pnl']:>12,}{g.get('open', 0):>10,}{g['cost']:>10,}")
-    sh = [x for x in led.get("shadow", []) if x["status"] in ("WIN", "LOSS")]
+    sh = [x for x in led.get("shadow", []) if "r" in x]
     if sh:
         print("\n影子部位（含實單以外的訊號）：")
         by: dict[str, list] = {}
@@ -584,6 +597,15 @@ def cmd_stats(a):
     if pr:
         brier = sum((p - o) ** 2 for p, o in pr) / len(pr)
         print(f"\n機率校準：{len(pr)} 筆，Brier {brier:.3f}（0.25 = 擲硬幣水準，越低越好）")
+    # 與零漂移基準 p0 比較：只有 Brier 低於 p0 的 Brier 才代表有判斷力
+    pz = [(p0(x["fill"], x["stop"], x["target"]), 1 if x["exit"] >= x["target"] else 0) for x in sh]
+    if pz:
+        bz = sum((p - o) ** 2 for p, o in pz) / len(pz)
+        print(f"零漂移基準 p0 的 Brier（影子）：{bz:.3f}；主控需低於此值才算有判斷力")
+    miss = [x for x in led.get("shadow", []) if x["status"] == "EXPIRED" and "missed_ret" in x]
+    if miss:
+        print(f"未成交到期影子 {len(miss)} 筆：若開盤即買，平均報酬 {sum(x['missed_ret'] for x in miss) / len(miss):+.2%}"
+              "（衡量『等拉回』的機會成本）")
 
 
 def cmd_status(a):
