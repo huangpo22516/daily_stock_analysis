@@ -8,6 +8,12 @@
   4. 委託規則（PLAYBOOK 決策原則與風控）：升降單位、限價距收盤 ±10% 內、停損<限價<目標、
      報酬/風險 ≥ 1.5、目標報酬 ≥ 5 倍來回成本、單檔 ≤ 20%（ETF 40%）、單筆風險 ≤ 1.5%、
      必填 strategy/note/invalid/prob、事前機率推得的期望值（扣成本）> 0
+  5. 籌碼乾淨度（免費替代指標，代替券商分點資料；2026-11-27 起）：
+     a. 融資餘額 5 日增幅 > 20%（散戶追價）
+     b. 當沖量占成交量 > 50%（隔日沖/短線主力）
+     c. 量能 > 20 日均量 3 倍且單日漲跌 > 5%（爆量異動，需查有無消息）
+     d. 集保千張大戶比例週減 ≥ 1 個百分點 且 總人數週增 ≥ 5%（大戶出、散戶進；需 tdcc_snapshot.py 累積兩週）
+     買進委託命中 2 項以上 = ERROR；1 項 = WARN（報告裡要說明為何仍可買）
 有 ERROR 時 exit code = 1。
 """
 from __future__ import annotations
@@ -93,6 +99,74 @@ def restricted_codes(target: str) -> dict:
     return res
 
 
+FM = "https://api.finmindtrade.com/api/v4/data"
+
+
+def _fm(ds, code, start, end):
+    for _ in range(3):  # FinMind 免費額度偶爾回空或逾時，重試
+        try:
+            d = requests.get(FM, params=dict(dataset=ds, data_id=code, start_date=start, end_date=end),
+                             timeout=30).json().get("data", [])
+            if d:
+                return d
+        except Exception:
+            pass
+    return []
+
+
+def chip_flags(code: str, before: str) -> list[str]:
+    """籌碼乾淨度的免費替代指標（FinMind 免費資料）。抓不到資料就回傳空清單並另外警告。"""
+    end = (date.fromisoformat(before) - timedelta(days=1)).isoformat()
+    start = (date.fromisoformat(before) - timedelta(days=45)).isoformat()
+    px = [r for r in _fm("TaiwanStockPrice", code, start, end) if r.get("Trading_Volume")]
+    if len(px) < 21:
+        warn(f"{code} 籌碼檢查：取不到足夠價量資料（FinMind），略過")
+        return []
+    flags = []
+    last, prev = px[-1], px[-2]
+    vol20 = sum(r["Trading_Volume"] for r in px[-21:-1]) / 20
+    ret = last["close"] / prev["close"] - 1
+    if last["Trading_Volume"] > 3 * vol20 and abs(ret) > 0.05:
+        flags.append(f"爆量異動（量 {last['Trading_Volume'] / vol20:.1f} 倍、{ret:+.1%}）")
+    # 當沖資料常晚一天更新（最新日為 0），取最近兩個交易日中有資料的一天
+    dt = {r["date"]: r["Volume"] for r in _fm("TaiwanStockDayTrading", code, start, end) if r.get("Volume")}
+    for r in (px[-1], px[-2]):
+        if r["date"] in dt:
+            if dt[r["date"]] / r["Trading_Volume"] > 0.5:
+                flags.append(f"當沖比 {dt[r['date']] / r['Trading_Volume']:.0%}（{r['date']}）")
+            break
+    mg = _fm("TaiwanStockMarginPurchaseShortSale", code, start, end)
+    if len(mg) >= 6 and mg[-6]["MarginPurchaseTodayBalance"] > 0:
+        g = mg[-1]["MarginPurchaseTodayBalance"] / mg[-6]["MarginPurchaseTodayBalance"] - 1
+        if g > 0.20:
+            flags.append(f"融資 5 日 +{g:.0%}")
+    t = _tdcc_change(code)
+    if t:
+        flags.append(t)
+    return flags
+
+
+def _tdcc_change(code: str) -> str | None:
+    import csv
+    import glob
+    import os
+    files = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "research", "tdcc", "*.csv")))
+    if len(files) < 2:
+        return None
+    snap = []
+    for f in files[-2:]:
+        with open(f, encoding="utf-8") as fh:
+            snap.append({r["code"]: r for r in csv.DictReader(fh)})
+    a, b = snap[0].get(code), snap[1].get(code)
+    if not (a and b and a["big_pct"] and b["big_pct"] and int(a["holders"]) > 0):
+        return None
+    dbig = float(b["big_pct"]) - float(a["big_pct"])
+    dh = int(b["holders"]) / int(a["holders"]) - 1
+    if dbig <= -1.0 and dh >= 0.05:
+        return f"集保大戶比例 {dbig:+.1f}pt、人數 {dh:+.0%}"
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="委託日（預設：待成交委託中最早的日期，否則明天）")
@@ -123,6 +197,15 @@ def main():
             err(f"{c} 單日漲跌 {chg / (ref[1] - chg) * 100:+.1f}% 超過漲跌停，資料可能有誤")
         if c in restricted:
             (err if any(o["code"] == c and o["side"] == "BUY" for o in pend) else warn)(f"{c} {restricted[c]}")
+    # 籌碼乾淨度（買單與等待中的影子）
+    buy_codes = {o["code"] for o in pend if o["side"] == "BUY"}
+    for c in sorted(buy_codes | {s["code"] for s in led.get("shadow", []) if s["status"] == "WAIT"}):
+        if E.is_etf(c):
+            continue
+        fl = chip_flags(c, target)
+        if fl:
+            msg = f"{c} 籌碼警訊：{'、'.join(fl)}"
+            (err if (c in buy_codes and len(fl) >= 2) else warn)(msg)
     # 委託規則
     for o in pend:
         tag = f"#{o['id']} {o['side']} {o['code']}"
